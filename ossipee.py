@@ -66,6 +66,8 @@ class Configuration(object):
         self.config.set(self.section, 'name', self.name)
         self.config.set(self.section, 'pubkey', self.key)
         self.config.set(self.section, 'forwarder',  self.forwarder)
+        self.config.set(self.section, 'nova_network',  False)
+        self.config.set(self.section, 'security_groups',  'default')
 
         logging.warning("Writing new config section %s to %s",
                         self.section,
@@ -109,11 +111,20 @@ class Configuration(object):
         if not self.config.has_section(self.section):
             self._default_config_options()
 
-        self.security_groups = ['default']
-
     def get(self, name, default=None):
         try:
-            return self.config.get(self.section, name)
+            if name == 'nova_network':
+                try:
+                    # if value is True, just use the first network available
+                    retval = self.config.getboolean(self.section, name)
+                except ValueError:
+                    # not a boolean - name of the network to use
+                    retval = self.config.get(self.section, name)
+            elif name == 'security_groups':
+                retval = self.config.get(self.section, name).split(',')
+            else:
+                retval = self.config.get(self.section, name)
+            return retval
         except ConfigParser.NoOptionError:
             logging.debug("Option %s not in config file, using default: %s",
                           name,
@@ -156,6 +167,13 @@ class Configuration(object):
     def forwarder(self):
         return self.get('forwarder', '192.168.52.3')
 
+    @property
+    def nova_network(self):
+        return self.get('nova_network', False)
+
+    @property
+    def security_groups(self):
+        return self.get('security_groups', 'default')
 
 class Plan(object):
     def __init__(self, configuration):
@@ -167,23 +185,27 @@ class Plan(object):
         self.security_groups = self.configuration.security_groups
         self.key = self.configuration.key
         self.profile = self.configuration.profile
+        self.nova_network = self.configuration.nova_network
 
         self.domain_name = name + '.test'
         self.inventory_dir = self.configuration.config_dir + '/inventory/'
         self.inventory_file = self.inventory_dir + name + '.ini'
 
-        self.networks = {
-            'public': {
-                'router_name': name + '-public-router',
-                'network_name': name + '-public-net',
-                'subnet_name': name + '-public-subnet',
-                'cidr': '192.168.52.0/24'},
-            'private': {
-                'router_name': name + '-private-router',
-                'network_name': name + '-private-net',
-                'subnet_name': name + '-private-subnet',
-                'cidr': '192.168.178.0/24'},
-        }
+        if not self.nova_network:
+            self.networks = {
+                'public': {
+                    'router_name': name + '-public-router',
+                    'network_name': name + '-public-net',
+                    'subnet_name': name + '-public-subnet',
+                    'cidr': '192.168.52.0/24'},
+                'private': {
+                    'router_name': name + '-private-router',
+                    'network_name': name + '-private-net',
+                    'subnet_name': name + '-private-subnet',
+                    'cidr': '192.168.178.0/24'},
+            }
+        elif self.nova_network != True:
+            self.networks = {'private': {'network_name': self.nova_network}}
         self.ipa_client_vars = self._get_client_vars()
         self.hosts = {}
 
@@ -255,8 +277,9 @@ class WorkItem(object):
         self.name = name
         self.keystone = keystone_v3.Client(session=session)
         self.nova = novaclient.Client('2', session=session)
-        self.neutron = neutronclient.Client('2.0', session=session)
-        self.neutron.format = 'json'
+        if not plan.nova_network:
+            self.neutron = neutronclient.Client('2.0', session=session)
+            self.neutron.format = 'json'
 
         self.plan = plan
 
@@ -377,7 +400,10 @@ class FloatIP(WorkItem):
         for float in ip_list:
             if float.instance_id is None:
                 return float
-        return None
+        # no spares available - create a new one - just use first available pool
+        pool = self.nova.floating_ip_pools.list()[0]
+        float = self.nova.floating_ips.create(pool.name)
+        return float
 
     def assign_next_ip(self, server):
         try:
@@ -456,10 +482,19 @@ class NovaServer(WorkItem):
             return
 
         nics = []
-        for net_name in ['public', 'private']:
+        network_names = ['public', 'private']
+        if self.plan.nova_network:
+            if self.plan.nova_network == True:
+                network_names = []
+            else:
+                network_names = [self.plan.nova_network]
+        for net_name in network_names:
             for network in self._networks_response(net_name)['networks']:
                 nics.append({'net-id': network['id']})
-
+        if not nics:
+            for network in self.nova.networks.list():
+                nics.append({'net-id': network.id})
+                break # just use first one
         response = self.nova.servers.create(
             self.fqdn(),
             self.get_image_id(self.plan.profile['image']),
@@ -642,7 +677,13 @@ class Inventory(FileWorkItem):
 
     def write_contents(self, f):
         ipa_server = self.get_server_by_name(self.make_fqdn('ipa'))
-        for nic in ipa_server.addresses[self.plan.name + '-public-net']:
+        network_name = self.plan.name + '-public-net'
+        if self.plan.nova_network:
+            if self.plan.nova_network == True:
+                network_name = self.nova.networks.list()[0].label
+            else:
+                network_name = self.plan.nova_network
+        for nic in ipa_server.addresses[network_name]:
             if nic['OS-EXT-IPS:type'] == 'fixed':
                 nameserver = nic['addr']
 
@@ -730,15 +771,19 @@ def PublicRouterInterface(session, plan):
 
 
 def PublicNetworkList(session, plan):
-    return WorkItemList(
-        [PublicRouter, PublicNetwork, PublicSubNet, PublicRouterInterface],
-        session, plan)
+    itemlist = [PublicRouter, PublicNetwork, PublicSubNet, PublicRouterInterface]
+    if plan.nova_network:
+        print "Using nova network, skipping PublicNetworkList"
+        itemlist = []
+    return WorkItemList(itemlist, session, plan)
 
 
 def PrivateNetworkList(session, plan):
-    return WorkItemList(
-        [PrivateNetwork, PrivateSubNet], session, plan)
-
+    itemlist = [PrivateNetwork, PrivateSubNet]
+    if plan.nova_network:
+        print "Using nova network, skipping PublicNetworkList"
+        itemlist = []
+    return WorkItemList(itemlist, session, plan)
 
 def enable_logging():
     logging.basicConfig(level=logging.DEBUG)
