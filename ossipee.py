@@ -82,6 +82,7 @@ class Configuration(object):
         self.config.set(self.section, 'forwarder',  self.forwarder)
         self.config.set(self.section, 'public_network', self.public_network)
         self.config.set(self.section, 'private_network', self.private_network)
+        self.config.set(self.section, 'security_groups', ",".join(self.security_groups))
 
         logging.warning("Writing new config section %s to %s",
                         self.section,
@@ -124,11 +125,12 @@ class Configuration(object):
         if not self.config.has_section(self.section):
             self._default_config_options()
 
-        self.security_groups = ['default']
-
     def get(self, name, default=None):
         try:
-            return self.config.get(self.section, name)
+            rv = self.config.get(self.section, name)
+            if name == 'security_groups':
+                rv = rv.split(',')
+            return rv
         except ConfigParser.NoOptionError:
             logging.debug("Option %s not in config file, using default: %s",
                           name,
@@ -178,6 +180,10 @@ class Configuration(object):
     @property
     def private_network(self):
         return self.config.getboolean(self.section, 'private_network')
+
+    @property
+    def security_groups(self):
+        return self.get('security_groups', ['default'])
 
 
 class Plan(object):
